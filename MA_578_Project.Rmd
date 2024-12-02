@@ -1,0 +1,205 @@
+---
+title: "MA_578_Project"
+author: "Alec Candib"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Dirichlet Data Simulation
+```{r}
+library(DirichletReg)
+#Set the fold change between controls and experimental
+fc=unlist(lapply(2^c(-8:8),rep,2))
+#Set number of replicates
+n=c(10000,10000)
+#Set the min alpha for samples
+minAlpha=1
+#Set the conditions for each
+conditions=data.frame(
+  #True signal determining the outcome
+  'True'=unlist(lapply(c(1:length(n)),function(i){return(rep(i,n[i]))}))#,
+  #False signal that is randomly distributed
+  #'False'=runif(sum(n)))
+#Confounding signal that is roughly correlated with the true signal 
+#conditions[['Conf']]=unlist(lapply(conditions[['True']],function(i){return(rnorm(1,i))})
+)
+
+#Get strings to represent the formulas for differential abundance
+formula_logistic=paste0('y~',paste0(colnames(conditions),collapse = '+'))
+formula_beta=paste0('y~',paste0(colnames(conditions),collapse = '+'),'|',paste0(colnames(conditions),collapse = '+'))
+
+#Calculate the relative alpha values to sample from
+conAlpha=1/(fc+1)
+expAlpha=1/(1+1/fc)
+#Adjust relative alpha values to at least minAlpha
+alphaAdjust=minAlpha/min(conAlpha,conAlpha)
+if(alphaAdjust>1){
+  conAlpha=conAlpha*alphaAdjust
+  expAlpha=expAlpha*alphaAdjust
+}
+#Perform sampling
+consolidated=data.frame(rbind(rdirichlet(n[1],conAlpha),rdirichlet(n[2],expAlpha)))
+#Gut check: Make sure all samples sum to 1 (range of (1,1))
+range(apply(consolidated,1,sum))
+
+#Sum up pseudo-tree structure
+#Adjacent taxa are added together
+#For odd number of taxa, the last taxa is ignored
+
+#Trackers
+continueTree=TRUE
+previousLayer=consolidated
+layerN=0
+layerTracker=rep(layerN,ncol(consolidated))
+previousRN=as.character(c(1:ncol(consolidated)))
+rn=previousRN
+while(continueTree){
+  layerN=layerN+1
+  nextLayer=data.frame(matrix(nrow=nrow(previousLayer)))
+  nextRN=c()
+  #Sum adjacent taxa
+  for(i in c(1:floor(ncol(previousLayer)/2))){
+    #Sum taxa
+    nextLayer[[i]]=unlist(previousLayer[2*i-1]+previousLayer[2*i])
+    #Get taxa name
+    nextRN=c(nextRN,paste0(previousRN[2*i-1],'+',previousRN[2*i]))
+  }
+  #If there is an odd number of taxa, keep the last taxa as is
+  if(ncol(previousLayer)%%2==1){
+    #Keep taxa
+    nextLayer[[ncol(nextLayer)+1]]=previousLayer[[ncol(previousLayer)]]
+    #Save taxa name
+    nextRN=c(nextRN,previousRN[length(previousRN)])
+  }
+  #Add this taxa to the data frame
+  consolidated=cbind(consolidated,nextLayer)
+  #Update trackers
+  previousLayer=nextLayer
+  previousRN=nextRN
+  rn=c(rn,nextRN)
+  #Check if this is the last layer: last layer has only one taxa
+  if(ncol(previousLayer)==1){
+    continueTree=FALSE
+  }
+  layerTracker=c(layerTracker,rep(layerN,ncol(nextLayer)))
+}
+
+#Invert dataframe so that samples=columns, taxa=rows
+consolidated=t(consolidated)
+#Calculate true fold change of each taxa
+foldChange=apply(consolidated[,(n[1]+1):(sum(n))],1,mean)/apply(consolidated[,1:n[1]],1,mean)
+treeLayer=layerTracker
+#Add tree layer to duplicate row names
+for(i in c(2:length(rn))){
+  if(rn[i] %in% rn[1:(i-1)]){
+    rn[i]=paste0(rn[i],'_',treeLayer[i])
+  }
+}
+rownames(consolidated)=rn
+
+#Get detection limit
+detectionLimit=apply(consolidated,2,function(i){i=i[i>0];return(min(i))})
+
+#Prepare data for logistic regression: 0 if missing, 1 if present
+consolidated_logistic=0+(consolidated>0)
+#Remove taxa that are present in all or no samples
+logistic_toAnalyze=apply(consolidated_logistic,1,function(i){return(length(unique(i)))})==2
+excluded_from_logistic=rownames(consolidated_logistic)[!logistic_toAnalyze]
+consolidated_logistic=consolidated_logistic[logistic_toAnalyze,]
+
+#write.csv(consolidated,'sampleData_10.csv')
+
+
+```
+
+Logistic Regression: Association between condition and missingness
+```{r}
+#Logistic regression on all rows
+#Note: Likely not be ready for multiple conditions
+logisticRegression=apply(consolidated_logistic,1,function(i){return(glm(i~conditions,family='binomial'))})
+
+
+#Summarize regression results
+
+#Extract first result as template
+lSample=summary(logisticRegression[[1]])$coefficients
+#Create dataframe to store results
+logistic_Summary=data.frame(matrix(ncol=0,nrow=nrow(lSample)*3))
+#Get rownames
+rownames(logistic_Summary)=unlist(lapply(rownames(lSample),function(i){return(c(paste0(i,'_coeff'),paste0(i,'_pval'),paste0(i,'_padj')))}))
+#Extract values
+for(i in c(1:length(logisticRegression))){
+  logResult=summary(logisticRegression[[i]])$coefficients
+  values=c()
+  #Extract coefficient and pval for each variable
+  for(j in nrow(logResult)){
+    values=c(values,logResult[j,1],logResult[j,4],NA)
+  }
+  logistic_Summary[[as.character(rownames(consolidated_logistic)[i])]]=values
+}
+
+#Adjust p values
+for(k in c(1:nrow(lSample))){
+  logistic_Summary[3*k,]=p.adjust(logistic_Summary[(3*k-1),],method = 'BH')
+}
+
+logistic_Summary=data.frame(t(logistic_Summary))
+
+```
+
+
+```{r}
+library(betareg)
+betaRegResults=apply(consolidated[c(1:4),],1,function(i){
+  df=cbind(y=i,conditions)
+  return(betareg(formula_beta,df))})
+
+#Summarize regression results
+
+#Extract first result as template
+bSample=summary(betaRegResults[[1]])$coefficients$mean
+beta_Summary=data.frame(matrix(ncol=0,nrow=nrow(bSample)*6))
+sumNames=unlist(lapply(rownames(bSample),function(i){return(c(paste0(i,'_coeff'),paste0(i,'_pval'),paste0(i,'_padj')))}))
+rownames(beta_Summary)=c(paste0('mean_',sumNames),paste0('precision_',sumNames))
+#Extract values
+for(i in c(1:length(betaRegResults))){
+  #Extract values from model for mean
+  betResult=summary(betaRegResults[[i]])$coefficients$mean
+  values=c()
+  #Extract coefficient and pval for each variable
+  for(j in c(1:nrow(betResult))){
+    values=c(values,betResult[j,1],betResult[j,4],NA)
+  }
+  #Extract values from model for precision
+  betResult=summary(betaRegResults[[i]])$coefficients$precision
+  #Extract coefficient and pval for each variable
+  for(j in c(1:nrow(betResult))){
+    values=c(values,betResult[j,1],betResult[j,4],NA)
+  }
+  beta_Summary[[as.character(rownames(consolidated)[i])]]=values
+}
+
+#Adjust p values
+for(k in c(1:(2*nrow(bSample)))){
+  beta_Summary[3*k,]=p.adjust(beta_Summary[(3*k-1),],method = 'BH')
+}
+
+beta_Summary=data.frame(t(beta_Summary))
+```
+
+Extract parameters for each taxa/sample combination from summary
+```{r}
+#Get dataframe of coefficients
+coeffDF=beta_Summary[,c(1:ncol(beta_Summary))%%3==1]
+#Evaluate estimate of mean for each sample at each taxa
+#coefficients*conditions + intercept = logit(mean)
+betaDist_mu=1/(1+exp(-as.matrix(coeffDF[,2:(ncol(coeffDF)/2)])%*%t(conditions)-coeffDF[,1]))
+#Evaluate estimate of precision for each sample at each taxa
+#coefficients*conditions + intercept = log(precision)
+betaDist_phi=exp(as.matrix(coeffDF[,c((2+ncol(coeffDF)/2):ncol(coeffDF))])%*%t(conditions)+coeffDF[,(1+ncol(coeffDF)/2)])
+#Transform parameters from mean/precision parameterization used by beta regression to original alpha/beta parameterization
+#alpha=mean*precision
+betaDist_alpha=betaDist_mu*betaDist_phi
+#beta=(1-mean)*precision
+betaDist_beta=(1-betaDist_mu)*betaDist_phi
+```
