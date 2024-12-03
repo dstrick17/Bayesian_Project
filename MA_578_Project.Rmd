@@ -24,10 +24,6 @@ conditions=data.frame(
 #conditions[['Conf']]=unlist(lapply(conditions[['True']],function(i){return(rnorm(1,i))})
 )
 
-#Get strings to represent the formulas for differential abundance
-formula_logistic=paste0('y~',paste0(colnames(conditions),collapse = '+'))
-formula_beta=paste0('y~',paste0(colnames(conditions),collapse = '+'),'|',paste0(colnames(conditions),collapse = '+'))
-
 #Calculate the relative alpha values to sample from
 conAlpha=1/(fc+1)
 expAlpha=1/(1+1/fc)
@@ -50,7 +46,7 @@ range(apply(consolidated,1,sum))
 continueTree=TRUE
 previousLayer=consolidated
 layerN=0
-layerTracker=rep(layerN,ncol(consolidated))
+treeLayer=rep(layerN,ncol(consolidated))
 previousRN=as.character(c(1:ncol(consolidated)))
 rn=previousRN
 while(continueTree){
@@ -81,14 +77,12 @@ while(continueTree){
   if(ncol(previousLayer)==1){
     continueTree=FALSE
   }
-  layerTracker=c(layerTracker,rep(layerN,ncol(nextLayer)))
+  treeLayer=c(treeLayer,rep(layerN,ncol(nextLayer)))
 }
 
 #Invert dataframe so that samples=columns, taxa=rows
 consolidated=t(consolidated)
-#Calculate true fold change of each taxa
-foldChange=apply(consolidated[,(n[1]+1):(sum(n))],1,mean)/apply(consolidated[,1:n[1]],1,mean)
-treeLayer=layerTracker
+
 #Add tree layer to duplicate row names
 for(i in c(2:length(rn))){
   if(rn[i] %in% rn[1:(i-1)]){
@@ -96,20 +90,37 @@ for(i in c(2:length(rn))){
   }
 }
 rownames(consolidated)=rn
+```
 
+Clean & preprocess data
+```{r}
+#Get strings to represent the formulas for differential abundance
+formula_logistic=paste0('y~',paste0(colnames(conditions),collapse = '+'))
+formula_beta=paste0('y~',paste0(colnames(conditions),collapse = '+'),'|',paste0(colnames(conditions),collapse = '+'))
+
+#Calculate true fold change of each taxa
+foldChange=apply(consolidated[,(n[1]+1):(sum(n))],1,mean)/apply(consolidated[,1:n[1]],1,mean)
+
+#Round off extremely low abundances (helps w/ floating point errors) 
+consolidated=round(consolidated,10)
 #Get detection limit
 detectionLimit=apply(consolidated,2,function(i){i=i[i>0];return(min(i))})
+#Remove rows with all 0s or all 1s
+all_toAnalyze=apply(consolidated,1,sum)
+all_toAnalyze=all_toAnalyze==0|all_toAnalyze==sum(n)
+excluded_all=rownames(consolidated)[all_toAnalyze]
+consolidated=consolidated[!all_toAnalyze,]
+#Get locations of 0s and 1s
+consolidated_zeros=consolidated==0
+consolidated_ones=consolidated==1
+
 
 #Prepare data for logistic regression: 0 if missing, 1 if present
 consolidated_logistic=0+(consolidated>0)
 #Remove taxa that are present in all or no samples
 logistic_toAnalyze=apply(consolidated_logistic,1,function(i){return(length(unique(i)))})==2
-excluded_from_logistic=rownames(consolidated_logistic)[!logistic_toAnalyze]
+excluded_logistic=rownames(consolidated_logistic)[!logistic_toAnalyze]
 consolidated_logistic=consolidated_logistic[logistic_toAnalyze,]
-
-#write.csv(consolidated,'sampleData_10.csv')
-
-
 ```
 
 Logistic Regression: Association between condition and missingness
@@ -132,7 +143,7 @@ for(i in c(1:length(logisticRegression))){
   logResult=summary(logisticRegression[[i]])$coefficients
   values=c()
   #Extract coefficient and pval for each variable
-  for(j in nrow(logResult)){
+  for(j in c(1:nrow(logResult))){
     values=c(values,logResult[j,1],logResult[j,4],NA)
   }
   logistic_Summary[[as.character(rownames(consolidated_logistic)[i])]]=values
@@ -147,7 +158,7 @@ logistic_Summary=data.frame(t(logistic_Summary))
 
 ```
 
-
+Beta regression: Association between condition and abundance, with abundance parameterized as beta distribution
 ```{r}
 library(betareg)
 betaRegResults=apply(consolidated[c(1:4),],1,function(i){
@@ -185,21 +196,67 @@ for(k in c(1:(2*nrow(bSample)))){
 }
 
 beta_Summary=data.frame(t(beta_Summary))
-```
 
-Extract parameters for each taxa/sample combination from summary
-```{r}
+#Extract beta parameters for each taxa/sample combination from summary
+
 #Get dataframe of coefficients
-coeffDF=beta_Summary[,c(1:ncol(beta_Summary))%%3==1]
+betaCoeffDF=beta_Summary[,c(1:ncol(beta_Summary))%%3==1]
 #Evaluate estimate of mean for each sample at each taxa
 #coefficients*conditions + intercept = logit(mean)
-betaDist_mu=1/(1+exp(-as.matrix(coeffDF[,2:(ncol(coeffDF)/2)])%*%t(conditions)-coeffDF[,1]))
+betaDist_mu=1/(1+exp(-as.matrix(betaCoeffDF[,2:(ncol(betaCoeffDF)/2)])%*%t(conditions)-betaCoeffDF[,1]))
 #Evaluate estimate of precision for each sample at each taxa
 #coefficients*conditions + intercept = log(precision)
-betaDist_phi=exp(as.matrix(coeffDF[,c((2+ncol(coeffDF)/2):ncol(coeffDF))])%*%t(conditions)+coeffDF[,(1+ncol(coeffDF)/2)])
+betaDist_phi=exp(as.matrix(betaCoeffDF[,c((2+ncol(betaCoeffDF)/2):ncol(betaCoeffDF))])%*%t(conditions)+betaCoeffDF[,(1+ncol(betaCoeffDF)/2)])
 #Transform parameters from mean/precision parameterization used by beta regression to original alpha/beta parameterization
 #alpha=mean*precision
 betaDist_alpha=betaDist_mu*betaDist_phi
 #beta=(1-mean)*precision
 betaDist_beta=(1-betaDist_mu)*betaDist_phi
+```
+
+Linear Regression: Linear association between condition and log(abundance)
+```{r}
+base=10
+
+consolidated_loglm=log(consolidated,base=base)
+
+logLMResults=apply(consolidated_loglm,1,function(i){
+  df=cbind(y=i,conditions)
+  return(lm(formula_logistic,df))})
+
+#Summarize regression results
+
+#Extract first result as template
+lmSample=summary(logLMResults[[1]])$coefficients
+#Create dataframe to store results
+loglm_Summary=data.frame(matrix(ncol=0,nrow=nrow(lmSample)*3))
+#Get rownames
+rownames(loglm_Summary)=unlist(lapply(rownames(lmSample),function(i){return(c(paste0(i,'_coeff'),paste0(i,'_pval'),paste0(i,'_padj')))}))
+#Extract values
+for(i in c(1:length(logLMResults))){
+  lmResult=summary(logLMResults[[i]])$coefficients
+  values=c()
+  #Extract coefficient and pval for each variable
+  for(j in c(1:nrow(lmResult))){
+    values=c(values,lmResult[j,1],lmResult[j,4],NA)
+  }
+  loglm_Summary[[as.character(rownames(consolidated)[i])]]=values
+}
+
+#Adjust p values
+for(k in c(1:nrow(lmSample))){
+  loglm_Summary[3*k,]=p.adjust(loglm_Summary[(3*k-1),],method = 'BH')
+}
+
+loglm_Summary=data.frame(t(loglm_Summary))
+
+#Extract loglm parameters for each taxa/sample combination from summary
+
+#Get dataframe of coefficients
+lmCoeffDF=loglm_Summary[,c(1:ncol(loglm_Summary))%%3==1]
+#Evaluate estimate of mean for each sample at each taxa
+#coefficients*conditions + intercept = logit(mean)
+lmDist_mu=as.matrix(lmCoeffDF[,2:(ncol(lmCoeffDF))])%*%t(conditions)+lmCoeffDF[,1]
+
+loglm_sd=unlist(lapply(logLMResults,function(i){return(summary(i)$sigma)}))
 ```
