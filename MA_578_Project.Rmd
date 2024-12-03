@@ -9,7 +9,7 @@ Dirichlet Data Simulation
 ```{r}
 library(DirichletReg)
 #Set the fold change between controls and experimental
-fc=unlist(lapply(2^c(-8:8),rep,2))
+fc=unlist(lapply(2^c(-10:10),rep,2))
 #Set number of replicates
 n=c(10000,10000)
 #Set the min alpha for samples
@@ -23,6 +23,12 @@ conditions=data.frame(
 #Confounding signal that is roughly correlated with the true signal 
 #conditions[['Conf']]=unlist(lapply(conditions[['True']],function(i){return(rnorm(1,i))})
 )
+#Set the proportion of missing values
+#Lowest values removed, before adding up tree
+propNA=0.2
+#Get strings to represent the formulas for differential abundance
+formula_logistic=paste0('y~',paste0(colnames(conditions),collapse = '+'))
+formula_beta=paste0('y~',paste0(colnames(conditions),collapse = '+'),'|',paste0(colnames(conditions),collapse = '+'))
 
 #Calculate the relative alpha values to sample from
 conAlpha=1/(fc+1)
@@ -35,6 +41,14 @@ if(alphaAdjust>1){
 }
 #Perform sampling
 consolidated=data.frame(rbind(rdirichlet(n[1],conAlpha),rdirichlet(n[2],expAlpha)))
+#Gut check: Make sure all samples sum to 1 (range of (1,1))
+range(apply(consolidated,1,sum))
+
+consolidated=data.frame(t(apply(consolidated,1,function(i){
+     i[i<quantile(i,propNA)]=0
+     i=i/sum(i)
+     return(i)})))
+
 #Gut check: Make sure all samples sum to 1 (range of (1,1))
 range(apply(consolidated,1,sum))
 
@@ -94,15 +108,11 @@ rownames(consolidated)=rn
 
 Clean & preprocess data
 ```{r}
-#Get strings to represent the formulas for differential abundance
-formula_logistic=paste0('y~',paste0(colnames(conditions),collapse = '+'))
-formula_beta=paste0('y~',paste0(colnames(conditions),collapse = '+'),'|',paste0(colnames(conditions),collapse = '+'))
-
 #Calculate true fold change of each taxa
 foldChange=apply(consolidated[,(n[1]+1):(sum(n))],1,mean)/apply(consolidated[,1:n[1]],1,mean)
 
-#Round off extremely low abundances (helps w/ floating point errors) 
-consolidated=round(consolidated,10)
+#Round such that the lowest abundance has 4 decimal places (helps w/ floating point errors) 
+consolidated=round(consolidated,-floor(log10(min(consolidated))-3))
 #Get detection limit
 detectionLimit=apply(consolidated,2,function(i){i=i[i>0];return(min(i))})
 #Remove rows with all 0s or all 1s
@@ -127,7 +137,9 @@ Logistic Regression: Association between condition and missingness
 ```{r}
 #Logistic regression on all rows
 #Note: Likely not be ready for multiple conditions
-logisticRegression=apply(consolidated_logistic,1,function(i){return(glm(i~conditions,family='binomial'))})
+logisticRegression=apply(consolidated_logistic,1,function(i){
+  df=cbind(y=i,conditions)
+  return(glm(formula_logistic,df,family='binomial'))})
 
 
 #Summarize regression results
@@ -155,6 +167,14 @@ for(k in c(1:nrow(lSample))){
 }
 
 logistic_Summary=data.frame(t(logistic_Summary))
+
+#Extract probability of measurement for each taxa/sample combination from summary
+
+#Get dataframe of coefficients
+logisticCoeffDF=logistic_Summary[,c(1:ncol(logistic_Summary))%%3==1]
+#Evaluate estimate of mean for each sample at each taxa
+#coefficients*conditions + intercept = logit(mean)
+logistic_pMeasured=1/(1+exp(-as.matrix(logisticCoeffDF[,2:(ncol(logisticCoeffDF))])%*%t(conditions)-logisticCoeffDF[,1]))
 
 ```
 
