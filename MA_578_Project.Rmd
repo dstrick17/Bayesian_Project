@@ -9,26 +9,23 @@ Dirichlet Data Simulation
 ```{r}
 library(DirichletReg)
 #Set the fold change between controls and experimental
-fc=unlist(lapply(2^c(-10:10),rep,2))
+fc=unlist(lapply(exp(c(-8:8)/4),rep,2))
 #Set number of replicates
-n=c(10000,10000)
+n=c(10,10)
 #Set the min alpha for samples
 minAlpha=1
 #Set the conditions for each
 conditions=data.frame(
   #True signal determining the outcome
-  'True'=unlist(lapply(c(1:length(n)),function(i){return(rep(i,n[i]))}))#,
+  'True'=unlist(lapply(c(1:length(n)),function(i){return(rep(i,n[i]))})))
   #False signal that is randomly distributed
   #'False'=runif(sum(n)))
 #Confounding signal that is roughly correlated with the true signal 
 #conditions[['Conf']]=unlist(lapply(conditions[['True']],function(i){return(rnorm(1,i))})
-)
+
 #Set the proportion of missing values
 #Lowest values removed, before adding up tree
-propNA=0.2
-#Get strings to represent the formulas for differential abundance
-formula_logistic=paste0('y~',paste0(colnames(conditions),collapse = '+'))
-formula_beta=paste0('y~',paste0(colnames(conditions),collapse = '+'),'|',paste0(colnames(conditions),collapse = '+'))
+propNA=.15
 
 #Calculate the relative alpha values to sample from
 conAlpha=1/(fc+1)
@@ -40,11 +37,11 @@ if(alphaAdjust>1){
   expAlpha=expAlpha*alphaAdjust
 }
 #Perform sampling
-consolidated=data.frame(rbind(rdirichlet(n[1],conAlpha),rdirichlet(n[2],expAlpha)))
+consolidated_prefiltering=data.frame(rbind(rdirichlet(n[1],conAlpha),rdirichlet(n[2],expAlpha)))
 #Gut check: Make sure all samples sum to 1 (range of (1,1))
-range(apply(consolidated,1,sum))
-
-consolidated=data.frame(t(apply(consolidated,1,function(i){
+range(apply(consolidated_prefiltering,1,sum))
+#Remove propNA of the data
+consolidated=data.frame(t(apply(consolidated_prefiltering,1,function(i){
      i[i<quantile(i,propNA)]=0
      i=i/sum(i)
      return(i)})))
@@ -104,26 +101,48 @@ for(i in c(2:length(rn))){
   }
 }
 rownames(consolidated)=rn
+
+#Calculate true fold change of each taxa
+foldChange=apply(consolidated[,(n[1]+1):(sum(n))],1,mean)/apply(consolidated[,1:n[1]],1,mean)
+```
+
+```{r}
+consolidated_og=read.csv('../PRJNA427129_cleaned.csv')
+rownames(consolidated_og)=consolidated_og[[1]]
+consolidated_og=consolidated_og[,-c(1)]
+consolidated=consolidated_og
+conditions=data.frame(
+  'Disease'=c(rep(1,21),rep(2,115)))
 ```
 
 Clean & preprocess data
 ```{r}
-#Calculate true fold change of each taxa
-foldChange=apply(consolidated[,(n[1]+1):(sum(n))],1,mean)/apply(consolidated[,1:n[1]],1,mean)
+#Exclude taxa with greater than this amount of zeros
+#For logistic regression, only exclude rows of all 0: =0.5/ncol(consolidated) 
+maxProp_zeros=0.5
+ 
+#Get strings to represent the formulas for differential abundance
+formula_logistic=paste0('y~',paste0(colnames(conditions),collapse = '+'))
+formula_beta=paste0('y~',paste0(colnames(conditions),collapse = '+'),'|',paste0(colnames(conditions),collapse = '+'))
 
 #Round such that the lowest abundance has 4 decimal places (helps w/ floating point errors) 
-consolidated=round(consolidated,-floor(log10(min(consolidated))-3))
-#Get detection limit
-detectionLimit=apply(consolidated,2,function(i){i=i[i>0];return(min(i))})
+consolidated=round(consolidated,-floor(log10(min(consolidated[consolidated>0]))-3))
+
 #Remove rows with all 0s or all 1s
-all_toAnalyze=apply(consolidated,1,sum)
-all_toAnalyze=all_toAnalyze==0|all_toAnalyze==sum(n)
+nZeros=apply(consolidated==0,1,sum)
+all_toAnalyze=(nZeros>maxProp_zeros*ncol(consolidated))|apply(consolidated==1,1,all)
 excluded_all=rownames(consolidated)[all_toAnalyze]
 consolidated=consolidated[!all_toAnalyze,]
+#Get detection limit: lowest measurement for each sample
+detectionLimit=apply(consolidated,2,function(i){i=i[i>0];return(min(i))})
+#Get highest measurement for each taxa below 1 
+taxaMax=apply(consolidated,1,function(i){i=i[i<1];return(max(i))})
 #Get locations of 0s and 1s
 consolidated_zeros=consolidated==0
 consolidated_ones=consolidated==1
-
+#Set initial starting point for beta MCMC sampling: a=b=1 (u=0.5, phi=2) (Uniform Distribution)
+beta_alphaSample=consolidated-consolidated+1
+beta_betaSample=beta_alphaSample
 
 #Prepare data for logistic regression: 0 if missing, 1 if present
 consolidated_logistic=0+(consolidated>0)
@@ -131,6 +150,297 @@ consolidated_logistic=0+(consolidated>0)
 logistic_toAnalyze=apply(consolidated_logistic,1,function(i){return(length(unique(i)))})==2
 excluded_logistic=rownames(consolidated_logistic)[!logistic_toAnalyze]
 consolidated_logistic=consolidated_logistic[logistic_toAnalyze,]
+
+#Save row & col names
+ogrn=rownames(consolidated)
+ogcn=colnames(consolidated)
+```
+
+Beta sampling: Use alphas and betas to get new imputations missing values  
+```{r}
+library(truncdist)
+consolidated=data.frame(lapply(c(1:ncol(consolidated)),function(j){
+  #For each sample j, get the detection limit for the sample
+  dl=detectionLimit[j]
+  return(unlist(lapply(c(1:nrow(consolidated)),function(i){
+    if(consolidated_zeros[i,j]){
+      ret=rtrunc(1,spec='beta',b=dl,shape1=beta_alphaSample[i,j],shape2=beta_betaSample[i,j])
+    }else if(consolidated_ones[i,j]){
+      #If the original value is 1, impute a value above the max for this taxa
+      ret=rtrunc(1,spec='beta',a=taxaMax[i],shape1=beta_alphaSample[i,j],shape2=beta_betaSample[i,j])
+    }else{
+      #If the original value is (0,1), return that value
+      ret=consolidated[i,j]
+    }
+    return(ret)
+    })))
+}))
+rownames(consolidated)=ogrn
+colnames(consolidated)=ogcn
+```
+
+Beta regression: Association between condition and abundance, with abundance parameterized as beta distribution
+```{r}
+library(betareg)
+library(MASS)
+method='MCMC'
+
+#Fit Beta Regression model
+betaRegResults=apply(consolidated,1,function(i){
+  df=cbind(y=i,conditions)
+  return(betareg(formula_beta,df))})
+
+#Sample beta parameters for each taxa/sample combination from summary
+
+#Get dataframe of coefficients
+beta_CoeffMLE=data.frame(lapply(betaRegResults,function(i){
+  z=rbind(summary(i)$coefficients$mean,summary(i)$coefficients$precision)
+  rownames(z)=c(paste0(rownames(summary(i)$coefficients$mean),'_mean'),paste0(rownames(summary(i)$coefficients$precision),'_precision'))
+  return(z[,1])})
+  ,check.names = FALSE)
+
+#Get covariance matrix of coefficients
+beta_Var=lapply(betaRegResults,vcov)
+
+#Sample the coefficients
+if(method=='MCMC'){
+  beta_CoeffSample=t(data.frame(lapply(ogrn,function(i){
+    return(mvrnorm(1,beta_CoeffMLE[,i],beta_Var[[i]]))})))
+}else{
+  #For EM, just use the MLE of the coefficients
+  beta_CoeffSample=t(beta_CoeffMLE)
+}
+
+rownames(beta_CoeffSample)=ogrn
+colnames(beta_CoeffSample)=rownames(beta_CoeffMLE)
+
+#Evaluate estimate of mean for each sample at each taxa
+#coefficients*conditions + intercept = logit(mean)
+beta_muSample=1/(1+exp(-as.matrix(beta_CoeffSample[,2:(ncol(beta_CoeffSample)/2)])%*%t(conditions)-beta_CoeffSample[,1]))
+
+#Evaluate estimate of precision for each sample at each taxa
+#coefficients*conditions + intercept = log(precision)
+beta_phiSample=exp(as.matrix(beta_CoeffSample[,c((2+ncol(beta_CoeffSample)/2):ncol(beta_CoeffSample))])%*%t(conditions)+beta_CoeffSample[,(1+ncol(beta_CoeffSample)/2)])
+
+#Transform parameters from mean/precision parameterization used by beta regression to original alpha/beta parameterization
+#alpha=mean*precision
+beta_alphaSample=beta_muSample*beta_phiSample
+#beta=(1-mean)*precision
+beta_betaSample=(1-beta_muSample)*beta_phiSample
+
+#For EM: Extract and adjust pvalues for this model
+#Not useful for MCMC: hypothesis test based on entirety of samples
+if(method=='EM'){
+  #Get dataframe of pvals
+  beta_p=t(data.frame(lapply(betaRegResults,function(i){
+    z=rbind(summary(i)$coefficients$mean,summary(i)$coefficients$precision)
+    rownames(z)=c(paste0(rownames(summary(i)$coefficients$mean),'_mean'),paste0(rownames(summary(i)$coefficients$precision),'_precision'))
+    return(z[,4])})
+    ,check.names = FALSE))
+  
+  beta_padj=apply(beta_p,2,p.adjust,method='BH')
+}
+
+```
+
+BETA GIBBS:
+-Loop between the previous 2 chunks a set number of times
+-At each iteration, save samples of coefficients and missing data
+-Eventually, structure chunks as a function:
+  -1. Data to samples of coefficients
+  -2. Coefficients to samples of missing data
+  
+```{r}
+library(truncdist)
+library(betareg)
+library(MASS)
+iterations=10000
+
+method='MCMC'
+
+coefficient_samples=list()
+data_samples=list()
+model_logLikelihood=list()
+model_rsq=list()
+
+#START
+print(Sys.time())
+for(iter in c(1:iterations)){
+  if(iter%%floor(iterations/100)==0){
+    print(iter)
+    print(Sys.time())
+  }
+  #PART 1: Sample missing data
+  consolidated=data.frame(lapply(c(1:ncol(consolidated)),function(j){
+    #For each sample j, get the detection limit for the sample
+    dl=detectionLimit[j]
+    return(unlist(lapply(c(1:nrow(consolidated)),function(i){
+      if(consolidated_zeros[i,j]){
+        ret=rtrunc(1,spec='beta',b=dl,shape1=beta_alphaSample[i,j],shape2=beta_betaSample[i,j])
+      }else if(consolidated_ones[i,j]){
+        #If the original value is 1, impute a value above the max for this taxa
+        ret=rtrunc(1,spec='beta',a=taxaMax[i],shape1=beta_alphaSample[i,j],shape2=beta_betaSample[i,j])
+      }else{
+        #If the original value is (0,1), return that value
+        ret=consolidated[i,j]
+      }
+      return(ret)
+      })))
+  }))
+  rownames(consolidated)=ogrn
+  colnames(consolidated)=ogcn
+  
+  #SAVE SAMPLE
+  data_samples[[iter]]=consolidated
+  
+  #PART 2: Sample coefficients -> parameters
+  
+  #Fit Beta Regression model
+  betaRegResults=apply(consolidated,1,function(i){
+    df=cbind(y=i,conditions)
+    return(betareg(formula_beta,df))})
+  
+  #Get model characteristics
+  model_rsq[[iter]]=lapply(betaRegResults,function(i){return(i$pseudo.r.squared)})
+  model_logLikelihood[[iter]]=lapply(betaRegResults,function(i){return(logLik(i)[1])})
+  
+  #Sample beta parameters for each taxa/sample combination from summary
+  
+  #Get dataframe of coefficients
+  beta_CoeffMLE=data.frame(lapply(betaRegResults,function(i){
+    z=rbind(summary(i)$coefficients$mean,summary(i)$coefficients$precision)
+    rownames(z)=c(paste0(rownames(summary(i)$coefficients$mean),'_mean'),paste0(rownames(summary(i)$coefficients$precision),'_precision'))
+    return(z[,1])})
+    ,check.names = FALSE)
+  
+  #Get covariance matrix of coefficients
+  beta_Var=lapply(betaRegResults,vcov)
+  
+  #Sample the coefficients
+  if(method=='MCMC'){
+    beta_CoeffSample=t(data.frame(lapply(ogrn,function(i){
+      return(mvrnorm(1,beta_CoeffMLE[,i],beta_Var[[i]]))})))
+  }else{
+    #For EM, just use the MLE of the coefficients
+    beta_CoeffSample=t(beta_CoeffMLE)
+  }
+  
+  rownames(beta_CoeffSample)=ogrn
+  colnames(beta_CoeffSample)=rownames(beta_CoeffMLE)
+  
+  #Evaluate estimate of mean for each sample at each taxa
+  #coefficients*conditions + intercept = logit(mean)
+  beta_muSample=1/(1+exp(-as.matrix(beta_CoeffSample[,2:(ncol(beta_CoeffSample)/2)])%*%t(conditions)-beta_CoeffSample[,1]))
+  
+  #Evaluate estimate of precision for each sample at each taxa
+  #coefficients*conditions + intercept = log(precision)
+  beta_phiSample=exp(as.matrix(beta_CoeffSample[,c((2+ncol(beta_CoeffSample)/2):ncol(beta_CoeffSample))])%*%t(conditions)+beta_CoeffSample[,(1+ncol(beta_CoeffSample)/2)])
+  
+  
+  #Transform parameters from mean/precision parameterization used by beta regression to original alpha/beta parameterization
+  #alpha=mean*precision
+  beta_alphaSample=beta_muSample*beta_phiSample
+  #beta=(1-mean)*precision
+  beta_betaSample=(1-beta_muSample)*beta_phiSample
+  
+  #Make sure alpha!=0,beta!=0: May occur due to rounding
+  #If this occurs, set sample to the lowest measured
+  if(min(c(beta_alphaSample,beta_betaSample))==0){
+    print(paste0('Warning: ',as.character(sum(c(beta_alphaSample,beta_betaSample)==0)),' parameters in iteration ',as.character(iter),' rounded down to 0: Using next lowest sample for this parameter in this iteration'))
+    beta_alphaSample[beta_alphaSample==0]=min(beta_alphaSample[beta_alphaSample>0])
+    beta_betaSample[beta_betaSample==0]=min(beta_betaSample[beta_betaSample>0])
+  }
+  
+  #SAVE SAMPLE
+  coefficient_samples[[iter]]=beta_CoeffSample
+}
+#END
+
+#Rearrange coefficient samples: Dataframe for each
+coefficient_samples_byVariable=lapply(colnames(coefficient_samples[[1]]),function(v){
+  vdf=t(data.frame(lapply(c(1:length(coefficient_samples)),function(it){
+     return(coefficient_samples[[it]][,v])})))
+  rownames(vdf)=c(1:nrow(vdf))
+  return(vdf)
+})
+names(coefficient_samples_byVariable)=colnames(coefficient_samples[[1]])
+print(Sys.time())
+
+```
+
+logLM Sampling
+```{r}
+consolidated=data.frame(lapply(c(1:ncol(consolidated)),function(j){
+  #For each sample j, get the detection limit for the sample
+  dl=detectionLimit[j]
+  return(unlist(lapply(c(1:nrow(consolidated)),function(i){
+    if(consolidated_zeros[i,j]){
+      #If the original value is 0, impute a value below the detection limit
+      ret=1
+      while(ret>dl){
+        ret=exp(rnorm(1,logLM_mu[i,j],logLM_sd[i]))
+      }
+    }else{
+      #If the original value is (0,1], return that value
+      ret=consolidated[i,j]
+    }
+    return(ret)
+    })))
+}))
+rownames(consolidated)=ogrn
+colnames(consolidated)=ogcn
+```
+
+Linear Regression: Linear association between condition and log(abundance)
+```{r}
+method='MCMC'
+
+consolidated_loglm=log(consolidated)
+
+logLMResults=apply(consolidated_loglm,1,function(i){
+  df=cbind(y=i,conditions)
+  return(lm(formula_logistic,df))})
+
+
+#Sample parameters for each taxa/sample combination from summary
+
+#Get dataframe of coefficients
+logLM_CoeffMLE=data.frame(lapply(logLMResults,function(i){
+  return(summary(i)$coefficients[,1])})
+  ,check.names = FALSE)
+
+#Get covariance matrix of coefficients
+loglm_Var=lapply(logLMResults,vcov)
+
+#Sample the coefficients
+if(method=='MCMC'){
+  logLM_CoeffSample=t(data.frame(lapply(c(1:length(ogrn)),function(i){
+    return(mvrnorm(1,logLM_CoeffMLE[,i],loglm_Var[[i]]))})))
+}else{
+  #For EM, just use the MLE of the coefficients
+  logLM_CoeffSample=t(logLM_CoeffMLE)
+}
+
+rownames(logLM_CoeffSample)=ogrn
+colnames(logLM_CoeffSample)=rownames(logLM_CoeffMLE)
+
+#Evaluate estimate of mean for each sample at each taxa
+#coefficients*conditions + intercept = logit(mean)
+logLM_mu=as.matrix(logLM_CoeffSample[,2:(ncol(logLM_CoeffSample))])%*%t(conditions)+logLM_CoeffSample[,1]
+
+#Evaluate estimate of sd at each taxa
+#Model assumes homoscedasticity: Same sd for all samples
+logLM_sd=unlist(lapply(logLMResults,function(i){return(summary(i)$sigma)}))
+
+#For EM: Extract and adjust pvalues for this model
+#Not useful for MCMC: hypothesis test based on entirety of samples
+if(method=='EM'){
+  #Get dataframe of pvals
+  logLM_p=t(data.frame(lapply(logLMResults,function(i){
+    return(summary(i)$coefficients[,4])})
+    ,check.names = FALSE))
+  logLM_padj=apply(beta_p,2,p.adjust,method='BH')
+}
 ```
 
 Logistic Regression: Association between condition and missingness
@@ -176,107 +486,4 @@ logisticCoeffDF=logistic_Summary[,c(1:ncol(logistic_Summary))%%3==1]
 #coefficients*conditions + intercept = logit(mean)
 logistic_pMeasured=1/(1+exp(-as.matrix(logisticCoeffDF[,2:(ncol(logisticCoeffDF))])%*%t(conditions)-logisticCoeffDF[,1]))
 
-```
-
-Beta regression: Association between condition and abundance, with abundance parameterized as beta distribution
-```{r}
-library(betareg)
-betaRegResults=apply(consolidated[c(1:4),],1,function(i){
-  df=cbind(y=i,conditions)
-  return(betareg(formula_beta,df))})
-
-#Summarize regression results
-
-#Extract first result as template
-bSample=summary(betaRegResults[[1]])$coefficients$mean
-beta_Summary=data.frame(matrix(ncol=0,nrow=nrow(bSample)*6))
-sumNames=unlist(lapply(rownames(bSample),function(i){return(c(paste0(i,'_coeff'),paste0(i,'_pval'),paste0(i,'_padj')))}))
-rownames(beta_Summary)=c(paste0('mean_',sumNames),paste0('precision_',sumNames))
-#Extract values
-for(i in c(1:length(betaRegResults))){
-  #Extract values from model for mean
-  betResult=summary(betaRegResults[[i]])$coefficients$mean
-  values=c()
-  #Extract coefficient and pval for each variable
-  for(j in c(1:nrow(betResult))){
-    values=c(values,betResult[j,1],betResult[j,4],NA)
-  }
-  #Extract values from model for precision
-  betResult=summary(betaRegResults[[i]])$coefficients$precision
-  #Extract coefficient and pval for each variable
-  for(j in c(1:nrow(betResult))){
-    values=c(values,betResult[j,1],betResult[j,4],NA)
-  }
-  beta_Summary[[as.character(rownames(consolidated)[i])]]=values
-}
-
-#Adjust p values
-for(k in c(1:(2*nrow(bSample)))){
-  beta_Summary[3*k,]=p.adjust(beta_Summary[(3*k-1),],method = 'BH')
-}
-
-beta_Summary=data.frame(t(beta_Summary))
-
-#Extract beta parameters for each taxa/sample combination from summary
-
-#Get dataframe of coefficients
-betaCoeffDF=beta_Summary[,c(1:ncol(beta_Summary))%%3==1]
-#Evaluate estimate of mean for each sample at each taxa
-#coefficients*conditions + intercept = logit(mean)
-betaDist_mu=1/(1+exp(-as.matrix(betaCoeffDF[,2:(ncol(betaCoeffDF)/2)])%*%t(conditions)-betaCoeffDF[,1]))
-#Evaluate estimate of precision for each sample at each taxa
-#coefficients*conditions + intercept = log(precision)
-betaDist_phi=exp(as.matrix(betaCoeffDF[,c((2+ncol(betaCoeffDF)/2):ncol(betaCoeffDF))])%*%t(conditions)+betaCoeffDF[,(1+ncol(betaCoeffDF)/2)])
-#Transform parameters from mean/precision parameterization used by beta regression to original alpha/beta parameterization
-#alpha=mean*precision
-betaDist_alpha=betaDist_mu*betaDist_phi
-#beta=(1-mean)*precision
-betaDist_beta=(1-betaDist_mu)*betaDist_phi
-```
-
-Linear Regression: Linear association between condition and log(abundance)
-```{r}
-base=10
-
-consolidated_loglm=log(consolidated,base=base)
-
-logLMResults=apply(consolidated_loglm,1,function(i){
-  df=cbind(y=i,conditions)
-  return(lm(formula_logistic,df))})
-
-#Summarize regression results
-
-#Extract first result as template
-lmSample=summary(logLMResults[[1]])$coefficients
-#Create dataframe to store results
-loglm_Summary=data.frame(matrix(ncol=0,nrow=nrow(lmSample)*3))
-#Get rownames
-rownames(loglm_Summary)=unlist(lapply(rownames(lmSample),function(i){return(c(paste0(i,'_coeff'),paste0(i,'_pval'),paste0(i,'_padj')))}))
-#Extract values
-for(i in c(1:length(logLMResults))){
-  lmResult=summary(logLMResults[[i]])$coefficients
-  values=c()
-  #Extract coefficient and pval for each variable
-  for(j in c(1:nrow(lmResult))){
-    values=c(values,lmResult[j,1],lmResult[j,4],NA)
-  }
-  loglm_Summary[[as.character(rownames(consolidated)[i])]]=values
-}
-
-#Adjust p values
-for(k in c(1:nrow(lmSample))){
-  loglm_Summary[3*k,]=p.adjust(loglm_Summary[(3*k-1),],method = 'BH')
-}
-
-loglm_Summary=data.frame(t(loglm_Summary))
-
-#Extract loglm parameters for each taxa/sample combination from summary
-
-#Get dataframe of coefficients
-lmCoeffDF=loglm_Summary[,c(1:ncol(loglm_Summary))%%3==1]
-#Evaluate estimate of mean for each sample at each taxa
-#coefficients*conditions + intercept = logit(mean)
-lmDist_mu=as.matrix(lmCoeffDF[,2:(ncol(lmCoeffDF))])%*%t(conditions)+lmCoeffDF[,1]
-
-loglm_sd=unlist(lapply(logLMResults,function(i){return(summary(i)$sigma)}))
 ```
